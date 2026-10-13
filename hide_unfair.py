@@ -13,11 +13,42 @@ import math
 import tensorflow as tf
 import keras
 import copy
+from scipy.stats import spearmanr
+
+
+####To run
+#LD_PRELOAD=/home/sourav/miniconda3/envs/r_env/lib/libstdc++.so.6 \python hide_unfair.py 2>&1 | tee run_arf_test.log
+
+#R bridging
+from attribution.arf_bridge import ARFDensity
 
 from keras import backend as K
-
 import random
 import os
+
+save_path = r'/home/sourav/arf_lik/JBShap/weights/arf_only'
+
+##hyperparameters
+# True  = train and save weights
+# False = load existing weights
+TRAIN_ORIGINAL = False
+TRAIN_OOD = False
+TRAIN_FAKE = False
+TRAIN_CES_SUP = False
+
+# Number of replicated datasets
+N_MASKED_COPIES = 20
+N_REAL_COPIES = 20
+
+N_TOTAL_COPIES = N_MASKED_COPIES + N_REAL_COPIES
+
+# ARF evaluation
+ARF_BATCH_SIZE = 5000
+
+LOW_Q = 0.10
+ATTACK_REGION = "arf_only"
+# choices: "both_low", "arf_only", "ood_only"
+
 
 def build_dataset(random_seed):
     X_raw,y_raw = shap_util.datasets.adult()
@@ -44,10 +75,10 @@ def build_regression(X_train_array, X_valid_array, y_train, y_valid, random_seed
     regression = Model(inputs=input_els, outputs=[out])
     regression.compile(optimizer="adam", loss='mse')
 
-    trained = True
+    #trained = True
 
     # train model
-    if not trained:
+    if TRAIN_ORIGINAL:
         regression.fit(
             X_train_array,
             y_train+ X_train_array[:,7]*0.1,
@@ -56,36 +87,39 @@ def build_regression(X_train_array, X_valid_array, y_train, y_valid, random_seed
             shuffle=True,
             validation_data=(X_valid_array, y_valid + X_valid_array[:,7]*0.1)
         )
-        regression.save_weights('./original_model_deep_{}.ckpt'.format(random_seed))
+        regression.save_weights(os.path.join(save_path,'original_model_deep_{}.weights.h5'.format(random_seed)))
     else:
-        regression.load_weights('./original_model_deep_{}.ckpt'.format(random_seed))
+        regression.load_weights(os.path.join(save_path,'original_model_deep_{}.weights.h5'.format(random_seed)))
     return regression
 
 
 def build_prob_data(regression, X_train_array, y_valid):
     sh1 = X_train_array.shape[0]
-    X_train_array_fake = np.zeros((X_train_array.shape[0]*100, X_train_array.shape[1]))
-    y_train_fake = np.zeros((X_train_array.shape[0]*100,3))
+    #p = X_train_array.shape[1]
+
+    X_train_array_fake = np.zeros((X_train_array.shape[0] * N_TOTAL_COPIES, X_train_array.shape[1]))
+    y_train_fake = np.zeros((X_train_array.shape[0]* N_TOTAL_COPIES, 3))
     # y_fake has size of (N, 3)
     # first dimension is prediction of regression
     # second dimension is whether on-manifold or off-manifold, 1 is on-manifold
     # third dimension is set to 0 now
     y_pred = regression.predict(X_train_array)[:,0]
 
-    for i in range(50):
+    for i in range(N_MASKED_COPIES):
         X_train_array_fake[sh1*i: sh1*(i+1), :] = X_train_array
         y_train_fake[sh1*i: sh1*(i+1),0] = y_pred
         y_train_fake[sh1*i: sh1*(i+1),1] = 0
 
-    for i in range(50):
-        X_train_array_fake[(50+i)*sh1:(51+i)*sh1 , :] = X_train_array
-        y_train_fake[(50+i)*sh1:(51+i)*sh1 ,1] = 1
+    for i in range(N_REAL_COPIES):
+        X_train_array_fake[(N_REAL_COPIES+i)*sh1:(N_REAL_COPIES + 1 +i)*sh1 , :] = X_train_array
+        y_train_fake[(N_REAL_COPIES+i)*sh1:(N_REAL_COPIES + 1 +i)*sh1 ,1] = 1
 
-    mask = np.reshape(np.random.choice(2,size=(X_train_array.shape[0])*50*12),((X_train_array.shape[0])*50,12))
-    mask = np.concatenate([mask,np.zeros((X_train_array.shape[0]*50,X_train_array.shape[1]))],axis=0)
+    mask = np.reshape(np.random.choice(2,size=(X_train_array.shape[0])* N_MASKED_COPIES *12),
+                      ((X_train_array.shape[0])* N_MASKED_COPIES, 12))
+    mask = np.concatenate([mask,np.zeros((X_train_array.shape[0]* N_MASKED_COPIES ,X_train_array.shape[1]))],axis=0)
 
     X_train_array_fake[np.where(mask>0)] = 0
-    for i in range(100):
+    for i in range(N_TOTAL_COPIES):
         # X_train_array_fake[sh1*i: sh1*(i+1), :] = X_train_array
         y_train_fake[sh1*i: sh1*(i+1),0] = regression.predict(X_train_array_fake[sh1*i: sh1*(i+1), :])[:,0]
 
@@ -99,14 +133,14 @@ def build_prob_model(X_train_array_fake, y_train_fake, random_seed):
     layer3_prob = Dense(200, activation="relu",kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(layer2_prob)
     out_prob = Dense(1)(layer3_prob)
 
-    trained = True
+    #trained = True
     model_prob = Model(inputs=input_prob, outputs=[out_prob])
     opt = keras.optimizers.SGD(learning_rate=1e-3, momentum = 0.9)
     #model_prob.compile(optimizer=opt, loss='mean_squared_error')
     loss = tf.keras.losses.BinaryCrossentropy(from_logits=True, label_smoothing=0.1)
     model_prob.compile(optimizer=opt, loss=loss)
     # train model
-    if not trained:
+    if TRAIN_OOD:
         model_prob.fit(
             X_train_array_fake,
             y_train_fake[:,1],
@@ -114,9 +148,9 @@ def build_prob_model(X_train_array_fake, y_train_fake, random_seed):
             batch_size=1000,
             shuffle=True,
         )
-        model_prob.save_weights('./prob_model_deep_{}.ckpt'.format(random_seed))
+        model_prob.save_weights(os.path.join(save_path,'prob_model_deep_{}.weights.h5'.format(random_seed)))
     else:
-        model_prob.load_weights('./prob_model_deep_{}.ckpt'.format(random_seed))
+        model_prob.load_weights(os.path.join(save_path,'prob_model_deep_{}.weights.h5'.format(random_seed)))
     return model_prob
 
 def sigmoid(x):
@@ -133,15 +167,104 @@ def build_regression_fake_data(regression, X_train_array_fake, y_train_fake, X_v
     # the idea is to find how OOD is the particular x, if it is OOD, prob_NCE will be small, and this dim should be large
     y_valid_fake = np.zeros((y_valid.shape[0],3))
     sh1 = X_train_array.shape[0]
-    for i in range(50):
-        y_train_fake[sh1*i: sh1*(i+1),2:] = 1- prob_NCE(X_train_array_fake[sh1*i: sh1*(i+1), :])
+    # for i in range(50):
+    #     y_train_fake[sh1*i: sh1*(i+1),2:] = 1- prob_NCE(X_train_array_fake[sh1*i: sh1*(i+1), :])
 
-    y_train_fake[np.where(X_train_array_fake[:,7]<=0),2] = 0
-    y_train_fake[np.where(y_train_fake[:,2]<0.8),2] = 0.0
+    # y_train_fake[np.where(X_train_array_fake[:,7]<=0),2] = 0
+    # y_train_fake[np.where(y_train_fake[:,2]<0.8),2] = 0.0
+
+    # ARF-defined attack region
+    n_masked = N_MASKED_COPIES * sh1
+    print("\nScoring masked points with ARF for attack-region cutoff...")
+
+    arf_scores_list = []
+
+    batch_size_arf = ARF_BATCH_SIZE
+
+    arf_scores_list = []
+
+    for start in range(0, n_masked, batch_size_arf):
+        end = min(start + batch_size_arf, n_masked)
+
+        print(
+            f"  ARF rows {start}:{end} / {n_masked}",
+            flush=True
+        )
+
+        scores_i = p_ARF(
+            X_train_array_fake[start:end, :]
+        )
+
+        arf_scores_list.append(
+            np.asarray(scores_i).flatten()
+        )
+
+    arf_scores_attack = np.concatenate(arf_scores_list)
+
+    # ARF / OOD density geometry
+    #to observe agreements and disagreements
+    #ARF/OOD both agree, only ARF agrees or only OOD agrees
+    
+    X_masked = X_train_array_fake[:n_masked, :]
+
+    # OOD/NCE density on exactly the same points
+    ood_scores_attack = np.asarray(
+        prob_NCE(X_masked)
+    ).flatten()
+
+    # Same percentile budget for both estimators
+    arf_cutoff = np.quantile(arf_scores_attack, LOW_Q)
+    ood_cutoff = np.quantile(ood_scores_attack, LOW_Q)
+
+    arf_low = arf_scores_attack <= arf_cutoff
+    ood_low = ood_scores_attack <= ood_cutoff
+
+    both_low = arf_low & ood_low
+    arf_only = arf_low & (~ood_low)
+    ood_only = ood_low & (~arf_low)
+
+    region_masks = {
+        "both_low": both_low,
+        "arf_only": arf_only,
+        "ood_only": ood_only,
+    }
+
+    attack_mask = region_masks[ATTACK_REGION].copy()
+
+    # preserve original attack restriction: positive-sex group only
+    attack_mask &= (X_masked[:, 7] > 0)
+
+    # third column controls malicious loss
+    y_train_fake[:, 2] = 0.0
+    y_train_fake[:n_masked, 2] = attack_mask.astype(float)
+
+    print("\n=== Density regions ===")
+    print("ARF low       :", arf_low.sum())
+    print("OOD low       :", ood_low.sum())
+    print("Both low      :", both_low.sum())
+    print("ARF only      :", arf_only.sum())
+    print("OOD only      :", ood_only.sum())
+    print("Attack region :", ATTACK_REGION)
+    print("Attack n      :", attack_mask.sum())
+
+    np.savez(
+    os.path.join(
+        save_path,
+        f"density_regions_{random_seed}.npz"
+    ),
+    X_masked=X_masked,
+    arf_scores=arf_scores_attack,
+    ood_scores=ood_scores_attack,
+    arf_low=arf_low,
+    ood_low=ood_low,
+    both_low=both_low,
+    arf_only=arf_only,
+    ood_only=ood_only,
+    )
     
     # X_train_array_fake2 just set the feature sex to 0
     X_train_array_fake2 = copy.copy(X_train_array_fake)
-    X_train_array_fake2[:(X_train_array.shape[0])*50,7] = 0
+    X_train_array_fake2[:(X_train_array.shape[0])* N_MASKED_COPIES, 7] = 0
     y_valid_fake[:,0:1] = regression.predict(X_valid_array)
     y_valid_fake[:,1] = 1
     kk = regression.predict(X_train_array_fake)
@@ -192,8 +315,8 @@ def build_regression_fake(X_train_array_fake, X_train_array_fake2, y_train_fake,
     # train new fake model
     regression_fake = Model(inputs=[input_els1, input_els2], outputs=out_final)
     regression_fake.compile(optimizer="adam", loss=fake_regression_loss)
-    trained = False
-    if not trained:
+    #trained = True
+    if TRAIN_FAKE:
         regression_fake.fit(
         [X_train_array_fake,X_train_array_fake2],
         y_train_fake,
@@ -202,39 +325,53 @@ def build_regression_fake(X_train_array_fake, X_train_array_fake2, y_train_fake,
         shuffle=True,
         validation_data=([X_valid_array,X_valid_array], y_valid_fake)
         )
-        regression_fake.save_weights('./regression_fake_deep_{}.ckpt'.format(random_seed))
+        regression_fake.save_weights(os.path.join(save_path,'regression_fake_deep_{}.weights.h5'.format(random_seed)))
     else:
-        regression_fake.load_weights('./regression_fake_deep_{}.ckpt'.format(random_seed))
+        regression_fake.load_weights(os.path.join(save_path,'regression_fake_deep_{}.weights.h5'.format(random_seed)))
     return regression_fake
 
 def build_CES_SUP_data(regression, model_prob, X_train_array, X_valid_array, y_valid):
     sh1 = X_train_array.shape[0]
-    X_train_array_fake = np.zeros((X_train_array.shape[0]*100, X_train_array.shape[1]))
-    y_train_fake = np.zeros((X_train_array.shape[0]*100,3))
+    X_train_array_fake = np.zeros((X_train_array.shape[0]* N_TOTAL_COPIES, X_train_array.shape[1]))
+    y_train_fake = np.zeros((X_train_array.shape[0]* N_TOTAL_COPIES,3))
     y_valid_fake = np.zeros((y_valid.shape[0],3))
     y_valid_fake[:,0:1] = regression.predict(X_valid_array)
     y_valid_fake[:,1] = 0
     y_pred = regression.predict(X_train_array)[:,0]
 
-    for i in range(50):
+    for i in range(N_MASKED_COPIES):
         X_train_array_fake[sh1*i: sh1*(i+1), :] = X_train_array
         y_train_fake[sh1*i: sh1*(i+1),0] = y_pred
         y_train_fake[sh1*i: sh1*(i+1),1] = 0
 
-    for i in range(50):
-        X_train_array_fake[(50+i)*sh1:(51+i)*sh1 , :] = X_train_array
-        y_train_fake[(50+i)*sh1:(51+i)*sh1 :,0] = y_pred
-        y_train_fake[(50+i)*sh1:(51+i)*sh1 ,1] = 1
-        y_train_fake[(50+i)*sh1:(51+i)*sh1 ,2] = 0
+    # for i in range(N_MASKED_COPIES):
+    #     X_train_array_fake[(N_MASKED_COPIES +i)*sh1:(N_MASKED_COPIES +i)*sh1 , :] = X_train_array
+    #     y_train_fake[(N_MASKED_COPIES+i)*sh1:(N_MASKED_COPIES + 1+i)*sh1 :,0] = y_pred
+    #     y_train_fake[(N_MASKED_COPIES+i)*sh1:(N_MASKED_COPIES + 1+i)*sh1 ,1] = 1
+    #     y_train_fake[(N_MASKED_COPIES+i)*sh1:(N_MASKED_COPIES + 1+i)*sh1 ,2] = 0
 
-    mask = np.reshape(np.random.choice(2,size=(X_train_array.shape[0])*50*12),((X_train_array.shape[0])*50,12))
-    mask = np.concatenate([mask,np.zeros((X_train_array.shape[0]*50,X_train_array.shape[1]))],axis=0)
+    for i in range(N_REAL_COPIES):
+
+        start = (N_MASKED_COPIES + i) * sh1
+        end = (N_MASKED_COPIES + i + 1) * sh1
+
+        X_train_array_fake[start:end, :] = X_train_array
+        y_train_fake[start:end, 0] = y_pred
+        y_train_fake[start:end, 1] = 1
+        y_train_fake[start:end, 2] = 0
+
+    mask = np.reshape(np.random.choice(2,size=(X_train_array.shape[0])* N_MASKED_COPIES *12),
+                      ((X_train_array.shape[0])* N_MASKED_COPIES,12))
+    mask = np.concatenate([mask,
+                          np.zeros((X_train_array.shape[0] * N_REAL_COPIES,
+                            X_train_array.shape[1]))],
+                          axis=0)
 
     X_train_array_fake[np.where(mask>0)] = 0
     X_train_array_fake2 = copy.copy(X_train_array_fake)
-    X_train_array_fake2[:(X_train_array.shape[0])*50,7] = 0
+    X_train_array_fake2[:(X_train_array.shape[0])* N_MASKED_COPIES,7] = 0
 
-    for i in range(50):
+    for i in range(N_MASKED_COPIES):
         y_train_fake[sh1*i: sh1*(i+1),2:] = 1- prob_NCE(X_train_array_fake[sh1*i: sh1*(i+1), :])
 
     y_train_fake[np.where(X_train_array_fake[:,7]<=0),2] = 0
@@ -314,8 +451,8 @@ def build_CES_SUP(X_train_array_fake, X_train_array_fake2, X_valid_array_fake, y
     out_final = Concatenate(axis=1)([out11, out12])
     regression_cessup = Model(inputs=[input_els1, input_els2], outputs=out_final)
     regression_cessup.compile(optimizer="adam", loss=custom_loss_ces1)
-    trained = False
-    if not trained:
+    #trained = True
+    if TRAIN_CES_SUP:
         regression_cessup.fit(
             [X_train_array_fake,X_train_array_fake2],
             y_train_fake,
@@ -324,9 +461,9 @@ def build_CES_SUP(X_train_array_fake, X_train_array_fake2, X_valid_array_fake, y
             shuffle=True,
             validation_data=([X_valid_array_fake,X_valid_array_fake], y_valid_fake)
             )
-        regression_cessup.save_weights('./cesssup_deep_{}.ckpt'.format(random_seed))
+        regression_cessup.save_weights(os.path.join(save_path,'cesssup_deep_{}.weights.h5'.format(random_seed)))
     else:
-        regression_cessup.load_weights('./cesssup_deep_{}.ckpt'.format(random_seed))
+        regression_cessup.load_weights(os.path.join(save_path,'cesssup_deep_{}.weights.h5'.format(random_seed)))
 
 
     # train CES sup on fake model 
@@ -351,8 +488,8 @@ def build_CES_SUP(X_train_array_fake, X_train_array_fake2, X_valid_array_fake, y
     regression_cessup2 = Model(inputs=[input_els1, input_els2], outputs=out_final)
     regression_cessup2.compile(optimizer="adam", loss=custom_loss_ces2)
 
-    trained = False
-    if not trained:
+    #trained = True
+    if TRAIN_CES_SUP:
         regression_cessup2.fit(
             [X_train_array_fake,X_train_array_fake2],
             y_train_fake,
@@ -361,9 +498,9 @@ def build_CES_SUP(X_train_array_fake, X_train_array_fake2, X_valid_array_fake, y
             shuffle=True,
             validation_data=([X_valid_array_fake,X_valid_array_fake], y_valid_fake)
             )
-        regression_cessup2.save_weights('./cesssup2_deep_{}.ckpt'.format(random_seed))
+        regression_cessup2.save_weights(os.path.join(save_path, 'cesssup2_deep_{}.weights.h5'.format(random_seed)))
     else:
-        regression_cessup2.load_weights('./cesssup2_deep_{}.ckpt'.format(random_seed))
+        regression_cessup2.load_weights(os.path.join(save_path,'cesssup2_deep_{}.weights.h5'.format(random_seed)))
 
     print('cessup')
     result = regression_cessup.evaluate([X_valid_array_fake,X_valid_array_fake], y_valid_fake, verbose=1)
@@ -399,6 +536,30 @@ def f_rjshap(X):
     b = tf.clip_by_value(prob_NCE(X).flatten().reshape(-1,sample),0,1)
     return tf.reduce_mean(a*b, axis=1)
 
+##ARF integration
+
+# ARF density diagnostics on actual JBShap coalition points
+arf_diag_real = []
+arf_diag_fake = []
+
+coalition_diag = {
+    "arf": [],
+    "ood": [],
+    "orig": [],
+    "fake": [],
+    "sex_present": [],
+}
+
+def p_ARF(X):
+    return arf_density.score(X)
+
+def f_arf_jshap(X):
+    a = regression.predict(X, verbose=0).flatten()
+    b = p_ARF(X)
+    # Store ARF density scores for the actual JBShap coalition points
+    arf_diag_real.append(np.asarray(b).flatten())
+    return a * b
+
 def f_fake(X):
     a = regression_fake.predict(X)[:,0].flatten()
     return a
@@ -425,6 +586,39 @@ def f_fake_rjshap(X):
     a = regression_fake.predict(X)[:,0].flatten().reshape(-1,sample)
     b = tf.clip_by_value(prob_NCE(X[0]).flatten().reshape(-1,sample),0,1)
     return tf.reduce_mean(a*b, axis=1)
+
+##ARF integration
+
+def f_fake_arf_jshap(X):
+
+    X0 = np.asarray(X[0])
+
+    fake_pred = regression_fake.predict(
+        X, verbose=0
+    )[:, 0].flatten()
+
+    orig_pred = regression.predict(
+        X0, verbose=0
+    ).flatten()
+
+    arf_score = p_ARF(X0)
+
+    ood_score = np.asarray(
+        prob_NCE(X0)
+    ).flatten()
+
+    arf_diag_fake.append(arf_score)
+
+    coalition_diag["arf"].append(arf_score)
+    coalition_diag["ood"].append(ood_score)
+    coalition_diag["orig"].append(orig_pred)
+    coalition_diag["fake"].append(fake_pred)
+
+    coalition_diag["sex_present"].append(
+        (X0[:, 7] != 0).astype(int)
+    )
+
+    return fake_pred * arf_score
 
 def generate_shap_y(n, x, f_temp, double_input=False, CES=False):
     ys = []
@@ -493,19 +687,208 @@ def calculate_shap(all_mean, method, f_method, f_fake_method, CES=False, double_
     print(total_shap/np.sum(np.abs(np.array(total_shap))))
     return all_mean
 
+###Helper for diagnosing
+def print_arf_diag(name, collected_scores, threshold=0.1):
+    if len(collected_scores) == 0:
+        print(f"{name}: no ARF scores collected")
+        return
+
+    scores = np.concatenate(collected_scores)
+
+    print(f"\n=== {name} ===")
+    print("n coalition evaluations :", len(scores))
+    print("min                    :", np.min(scores))
+    print("median                 :", np.median(scores))
+    print("mean                   :", np.mean(scores))
+    print("max                    :", np.max(scores))
+    print("fraction < 0.1         :", np.mean(scores < threshold))
+    print("fraction < 0.01        :", np.mean(scores < 0.01))
+    print("fraction == 0          :", np.mean(scores == 0))
+
+
+def print_coalition_attack_diag(random_seed):
+
+    arf = np.concatenate(coalition_diag["arf"])
+    ood = np.concatenate(coalition_diag["ood"])
+    orig = np.concatenate(coalition_diag["orig"])
+    fake = np.concatenate(coalition_diag["fake"])
+    sex_present = np.concatenate(
+        coalition_diag["sex_present"]
+    )
+
+    delta = np.abs(fake - orig)
+
+    # Reference distribution used to define ARF/OOD low regions
+    ref = np.load(
+        os.path.join(
+            save_path,
+            f"density_regions_{random_seed}.npz"
+        )
+    )
+
+    arf_ref = np.sort(ref["arf_scores"])
+    ood_ref = np.sort(ref["ood_scores"])
+
+    # Percentile of each exact coalition relative to masked cloud
+    arf_pct = np.searchsorted(
+        arf_ref, arf, side="right"
+    ) / len(arf_ref)
+
+    ood_pct = np.searchsorted(
+        ood_ref, ood, side="right"
+    ) / len(ood_ref)
+
+    arf_low = arf_pct <= LOW_Q
+    ood_low = ood_pct <= LOW_Q
+
+    both = arf_low & ood_low
+    arf_only = arf_low & (~ood_low)
+    ood_only = ood_low & (~arf_low)
+
+    # Coalition points where attack has largest effect
+    delta_cut = np.quantile(delta, 0.90)
+    high_effect = delta >= delta_cut
+
+    # actual explanation weights
+    arf_weight = arf
+    ood_weight = np.clip(ood, 0, 1)
+
+    def weight_share(w, mask):
+        return np.sum(w[mask]) / np.sum(w)
+
+    print("\n======================================")
+    print("EXACT SHAP COALITION DIAGNOSTIC")
+    print("======================================")
+
+    print("\nAttack effect |fake-original|")
+    print("median :", np.median(delta))
+    print("90%    :", np.quantile(delta, 0.90))
+    print("max    :", np.max(delta))
+
+    print("\nAll coalition points")
+    print("ARF low  :", np.mean(arf_low))
+    print("OOD low  :", np.mean(ood_low))
+    print("Both     :", np.mean(both))
+    print("ARF only :", np.mean(arf_only))
+    print("OOD only :", np.mean(ood_only))
+
+    print("\nTop 10% attack-effect coalition points")
+    print("ARF low  :", np.mean(arf_low[high_effect]))
+    print("OOD low  :", np.mean(ood_low[high_effect]))
+    print("Both     :", np.mean(both[high_effect]))
+    print("ARF only :", np.mean(arf_only[high_effect]))
+    print("OOD only :", np.mean(ood_only[high_effect]))
+
+    print("\nMedian density percentile among high-effect points")
+    print("ARF :", np.median(arf_pct[high_effect]))
+    print("OOD :", np.median(ood_pct[high_effect]))
+
+    print("\nWeight assigned to top-10% attack-effect points")
+    print(
+        "ARF weight share :",
+        weight_share(arf_weight, high_effect)
+    )
+    print(
+        "OOD weight share :",
+        weight_share(ood_weight, high_effect)
+    )
+
+    print("\nDensity percentile vs attack magnitude")
+    print(
+        "ARF Spearman :",
+        spearmanr(arf_pct, delta).statistic
+    )
+    print(
+        "OOD Spearman :",
+        spearmanr(ood_pct, delta).statistic
+    )
+
+    print("\nAttack effect by Sex coalition state")
+    print(
+        "Sex present:",
+        np.mean(delta[sex_present == 1])
+    )
+    print(
+        "Sex absent :",
+        np.mean(delta[sex_present == 0])
+    )
+
+    # Save for later plots
+    out = np.column_stack([
+        arf_pct,
+        ood_pct,
+        arf,
+        ood,
+        orig,
+        fake,
+        delta,
+        sex_present,
+    ])
+
+    np.savetxt(
+        os.path.join(
+            save_path,
+            f"coalition_diagnostic_{ATTACK_REGION}_q{int(LOW_Q*100)}_{random_seed}.csv"
+        ),
+        out,
+        delimiter=",",
+        header=(
+            "arf_percentile,ood_percentile,"
+            "arf_score,ood_score,"
+            "original_prediction,fake_prediction,"
+            "abs_delta,sex_present"
+        ),
+        comments=""
+    )
+
+
 ### Main file
 ### vary random seed
-for random_seed in range(10,15,1):
+#for random_seed in range(10,15,1):
+for random_seed in [10]:
+    ##diagnostics
+    arf_diag_real.clear()
+    arf_diag_fake.clear()
+    for v in coalition_diag.values():
+        v.clear()
+    ##
     ### Train Simple model
     random.seed(random_seed)
     tf.random.set_seed(random_seed)
     np.random.seed(random_seed)
     os.environ['PYTHONHASHSEED']=str(random_seed)
     
-    sample = 10
-    total_data = 100
+    #sample = 10
+    sample = 3
+    #total_data = 100
+    total_data = 5
     
     X_train, X_valid, y_train, y_valid, X_train_array, X_valid_array = build_dataset(random_seed)
+
+    arf_density = ARFDensity(
+    num_trees=30,
+    n_jobs=4,
+    seed=10,
+    low_density_threshold= None
+    #low_density_shrink= 0.0
+    )
+
+    arf_density.fit(X_train_array)
+
+    X_test_arf = X_train_array[:20]
+
+    X_test_arf_masked = X_test_arf.copy()
+    X_test_arf_masked[:, :6] = 0
+
+    p_real = p_ARF(X_test_arf)
+    p_masked = p_ARF(X_test_arf_masked)
+
+    print("\nARF sanity check")
+    print("real:", p_real)
+    print("masked:", p_masked)
+    print("median real:", np.median(p_real))
+    print("median masked:", np.median(p_masked))
+
     regression = build_regression(X_train_array, X_valid_array, y_train, y_valid, random_seed)
     
     X_train_array_fake, y_train_fake = build_prob_data(regression, X_train_array, y_valid)
@@ -554,5 +937,25 @@ for random_seed in range(10,15,1):
     all_mean = calculate_shap(all_mean, 'JBSHAP', f_jshap, f_fake_jshap, False)
     all_mean = calculate_shap(all_mean, 'RJBSHAP', f_rjshap, f_fake_rjshap, 'rj')
 
+    all_mean = calculate_shap(
+    all_mean,
+    'ARF-JBSHAP',
+    f_arf_jshap,
+    f_fake_arf_jshap,
+    False
+    )
+
+    print_arf_diag(
+    "ARF densities: REAL model coalition points",
+    arf_diag_real
+    )
+
+    print_arf_diag(
+        "ARF densities: FAKE model coalition points",
+        arf_diag_fake
+    )
+
+    print_coalition_attack_diag(random_seed)
+
     a = np.asarray(all_mean)
-    np.savetxt("all_unfair_newp_deep_{}.csv".format(random_seed), a, delimiter=",")
+    np.savetxt(os.path.join(save_path, f"all_unfair_newp_deep_{random_seed}.csv"), a, delimiter=",")
